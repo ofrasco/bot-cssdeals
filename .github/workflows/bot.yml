@@ -59,7 +59,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Modo hospedado: memoria em arquivo de texto
           ARQUIVO_ESTADO: vistos.txt
-          TRADUZIR: 'sim'
+          # Traducao DESLIGADA de proposito: cada titulo traduzido significa
+          # uma chamada extra a um servico externo antes de conseguir avisar
+          # voce — e isso atrasa a notificacao. Preferimos velocidade.
+          TRADUZIR: 'nao'
           TRADUCAO_EMAIL: ${{ secrets.TRADUCAO_EMAIL }}
           CATEGORIA_ID: ${{ vars.CATEGORIA_ID }}
         run: python bot.py
