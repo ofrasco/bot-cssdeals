@@ -24,7 +24,7 @@ import sqlite3
 import sys
 import time
 import urllib.robotparser
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -111,11 +111,12 @@ ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
 # minuto, enquanto o site publica ~2 produtos a cada 15 minutos.
 # O valor real e lido do .env em carregar_config() — este e so o padrao.
 INTERVALO_PADRAO = 60
-DELAY_ENTRE_REQUISICOES = 1.5     # segundos de pausa entre paginas do site
+DELAY_ENTRE_REQUISICOES = 1.5     # (sem uso no momento — ver DELAY_ENTRE_PAGINAS)
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
 MAX_TENTATIVAS = 3                # quantas vezes tentar de novo se der erro
 MAX_NOTIFICACOES_POR_RODADA = 20  # trava de seguranca contra spam
+MAX_IMAGENS_DISCORD = 4           # quantas fotos no maximo mostrar na galeria do Discord
 
 # --- Traducao dos titulos ---
 # Os titulos vem do site em chines e ingles. O bot traduz para portugues
@@ -197,6 +198,13 @@ def abrir_banco() -> sqlite3.Connection:
         )
         """
     )
+    # Coluna adicionada depois — guarda TODAS as fotos do produto (nao so
+    # a primeira), separadas por "|". Banco antigo nao tem essa coluna
+    # ainda, entao tentamos criar e ignoramos o erro se ja existir.
+    try:
+        conexao.execute("ALTER TABLE itens ADD COLUMN imagens TEXT")
+    except sqlite3.OperationalError:
+        pass
     conexao.commit()
     return conexao
 
@@ -225,13 +233,13 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
     conexao.execute(
         """
         INSERT OR IGNORE INTO itens
-            (id, titulo, titulo_pt, imagem, link, preco, categoria, plataforma,
-             origem, visto_em, notificado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, titulo, titulo_pt, imagem, imagens, link, preco, categoria,
+             plataforma, origem, visto_em, notificado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"], item["titulo"], item.get("titulo_pt", ""),
-            item["imagem"], item["link"],
+            item["imagem"], "|".join(item.get("imagens") or []), item["link"],
             item["preco"], item["categoria"], item["plataforma"], item["origem"],
             datetime.now().isoformat(timespec="seconds"),
             1 if ja_notificado else 0,
@@ -251,15 +259,16 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     """
     cursor = conexao.execute(
         """
-        SELECT id, titulo, titulo_pt, imagem, link, preco, categoria,
+        SELECT id, titulo, titulo_pt, imagem, imagens, link, preco, categoria,
                plataforma, origem
         FROM itens WHERE notificado = 0 ORDER BY visto_em
         """
     )
     return [
         {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "imagem": l[3],
-         "link": l[4], "preco": l[5], "categoria": l[6], "plataforma": l[7],
-         "origem": l[8]}
+         "imagens": (l[4] or "").split("|") if l[4] else ([l[3]] if l[3] else []),
+         "link": l[5], "preco": l[6], "categoria": l[7], "plataforma": l[8],
+         "origem": l[9]}
         for l in cursor.fetchall()
     ]
 
@@ -295,24 +304,42 @@ def criar_sessao() -> requests.Session:
     return sessao
 
 
+# Cache do robots.txt: guarda a ultima resposta por um tempo, em vez de
+# buscar o arquivo de novo a cada rodada. Isso tira uma requisicao inteira
+# (ida e volta ao site) do caminho critico entre "produto foi lancado" e
+# "voce foi avisado" — sem precisar mexer no INTERVALO_SEGUNDOS.
+_VALIDADE_CACHE_ROBOTS = 3600   # 1 hora
+_cache_robots: dict[str, tuple[bool, float]] = {}
+
+
 def robots_permite(url: str) -> bool:
     """
     Le o robots.txt do site e confere se o bot tem permissao de acessar.
 
     E o equivalente a bater na porta antes de entrar. Se nao conseguir ler o
     robots.txt, assume que pode (comportamento padrao da internet).
+
+    O resultado fica em cache por _VALIDADE_CACHE_ROBOTS segundos: nao faz
+    sentido reler o robots.txt a cada rodada, ja que ele quase nunca muda.
     """
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    em_cache = _cache_robots.get(base)
+    if em_cache and (time.time() - em_cache[1]) < _VALIDADE_CACHE_ROBOTS:
+        return em_cache[0]
+
     try:
-        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         leitor = urllib.robotparser.RobotFileParser()
         leitor.set_url(urljoin(base, "/robots.txt"))
         leitor.read()
         permitido = leitor.can_fetch(USER_AGENT, url)
         if not permitido:
             log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
+        _cache_robots[base] = (permitido, time.time())
         return permitido
     except Exception as erro:
         log.warning("Nao consegui ler o robots.txt (%s). Seguindo com cautela.", erro)
+        _cache_robots[base] = (True, time.time())
         return True
 
 
@@ -415,10 +442,23 @@ def montar_item(registro: dict) -> Optional[dict]:
     if not titulo:
         titulo = "(produto sem titulo)"
 
-    # Primeira foto: a imagem da primeira variacao do produto
+    # Fotos: prioridade e SEMPRE para as fotos das variacoes (skus) do
+    # produto — sao as mesmas que aparecem na PROPRIA PAGINA DO PRODUTO,
+    # podendo ter uma ou varias (uma por cor/variacao). Só usamos a capa
+    # (campo "thumbnail", a foto da pagina inicial/lista do site) se o
+    # produto nao tiver NENHUMA foto de variacao.
     skus = registro.get("skus") or []
     primeiro_sku = skus[0] if skus else {}
-    imagem = str(primeiro_sku.get("image") or registro.get("thumbnail") or "").strip()
+    imagens = []
+    for sku in skus:
+        candidata = str(sku.get("image") or "").strip()
+        if candidata and candidata not in imagens:
+            imagens.append(candidata)
+    if not imagens:
+        capa = str(registro.get("thumbnail") or "").strip()
+        if capa:
+            imagens.append(capa)
+    imagem = imagens[0] if imagens else ""
 
     # Preco: a API devolve em yuan; converte para real tambem
     preco = montar_preco(primeiro_sku.get("price"))
@@ -427,7 +467,8 @@ def montar_item(registro: dict) -> Optional[dict]:
         "id": produto_id,                                   # id do proprio site
         "titulo": titulo,
         "titulo_pt": "",                                    # preenchido depois
-        "imagem": imagem,
+        "imagem": imagem,                                   # foto principal (compatibilidade)
+        "imagens": imagens,                                 # todas as fotos, na ordem
         "link": URL_PRODUTO.format(id=produto_id),          # link de compra
         "preco": preco,
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
@@ -743,6 +784,10 @@ def montar_texto_telegram(item: dict) -> str:
     if item.get("link"):
         linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
 
+    if item.get("publicado_em"):
+        horario = item["publicado_em"].strftime("%d/%m/%Y %H:%M UTC")
+        linhas.append(escapar_html("Publicado: {}".format(horario)))
+
     return "\n".join(linhas)
 
 
@@ -755,19 +800,38 @@ def enviar_telegram(item: dict, token: str, chat_id: str) -> bool:
     """
     Envia UM item para o grupo do Telegram.
 
-    Se o item tem foto, manda a foto com legenda. Se nao tem (ou se a foto
-    falhar), manda so o texto. Devolve True se conseguiu enviar.
+    Se o item tem 2+ fotos, manda um album (todas as fotos juntas, legenda
+    so na primeira). Se tem 1 foto, manda ela com legenda. Se nao tem foto
+    (ou o envio falhar), manda so o texto. Devolve True se conseguiu enviar.
     """
     texto = montar_texto_telegram(item)
     base = f"https://api.telegram.org/bot{token}"
+    imagens = item.get("imagens") or ([item["imagem"]] if item.get("imagem") else [])
 
-    # Tentativa 1: mandar com a foto
-    if item["imagem"]:
+    # Tentativa 1: album com todas as fotos (Telegram aceita ate 10)
+    if len(imagens) > 1:
+        midia = [
+            {"type": "photo", "media": url}
+            for url in imagens[:10]
+        ]
+        midia[0]["caption"] = texto
+        midia[0]["parse_mode"] = "HTML"
+        ok = _post_telegram(
+            f"{base}/sendMediaGroup",
+            {"chat_id": chat_id, "media": midia},
+            como_json=True,
+        )
+        if ok:
+            return True
+        log.warning("Nao deu para mandar o album de fotos. Tentando so a primeira...")
+
+    # Tentativa 2: mandar so a primeira foto
+    if imagens:
         ok = _post_telegram(
             f"{base}/sendPhoto",
             {
                 "chat_id": chat_id,
-                "photo": item["imagem"],
+                "photo": imagens[0],
                 "caption": texto,
                 "parse_mode": "HTML",
             },
@@ -776,7 +840,7 @@ def enviar_telegram(item: dict, token: str, chat_id: str) -> bool:
             return True
         log.warning("Nao deu para mandar a foto. Tentando so com texto...")
 
-    # Tentativa 2 (ou unica): so texto
+    # Tentativa 3 (ou unica): so texto
     return _post_telegram(
         f"{base}/sendMessage",
         {
@@ -788,9 +852,12 @@ def enviar_telegram(item: dict, token: str, chat_id: str) -> bool:
     )
 
 
-def _post_telegram(url: str, dados: dict) -> bool:
+def _post_telegram(url: str, dados: dict, como_json: bool = False) -> bool:
     """
     Faz o envio de fato e trata os erros SEM derrubar o script.
+
+    `como_json=True` e usado pelo sendMediaGroup, que precisa do campo
+    "media" como lista de verdade (envio normal em forms nao suporta isso).
 
     Erros tratados:
       - 429 (rate limit): espera o tempo que o Telegram pedir e tenta de novo
@@ -799,7 +866,10 @@ def _post_telegram(url: str, dados: dict) -> bool:
     """
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            resposta = requests.post(url, data=dados, timeout=TIMEOUT)
+            if como_json:
+                resposta = requests.post(url, json=dados, timeout=TIMEOUT)
+            else:
+                resposta = requests.post(url, data=dados, timeout=TIMEOUT)
 
             if resposta.status_code == 200:
                 return True
@@ -872,8 +942,14 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     }
     if item.get("link"):
         embed["url"] = item["link"]
-    if item.get("imagem"):
-        embed["image"] = {"url": item["imagem"]}
+    imagens = item.get("imagens") or ([item["imagem"]] if item.get("imagem") else [])
+    if imagens:
+        embed["image"] = {"url": imagens[0]}
+    # Horario em que o bot detectou/publicou o lancamento. O Discord mostra
+    # isso automaticamente no rodape do card, JA CONVERTIDO para o fuso
+    # horario de cada pessoa que ve a mensagem (nao precisa formatar nada).
+    if item.get("publicado_em"):
+        embed["timestamp"] = item["publicado_em"].isoformat()
 
     detalhes = []
     original = item["titulo"]
@@ -887,10 +963,18 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
+    # Fotos extras: o Discord agrupa varios embeds numa unica galeria
+    # quando todos compartilham a mesma "url" — por isso os embeds extras
+    # so tem a foto, sem repetir titulo/descricao.
+    embeds = [embed]
+    if item.get("link"):
+        for extra in imagens[1:MAX_IMAGENS_DISCORD]:
+            embeds.append({"url": item["link"], "image": {"url": extra}})
+
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             resposta = requests.post(
-                webhook_url, json={"embeds": [embed]}, timeout=TIMEOUT
+                webhook_url, json={"embeds": embeds}, timeout=TIMEOUT
             )
 
             if resposta.status_code in (200, 204):
@@ -1067,7 +1151,9 @@ def rodar_coleta(config: dict) -> None:
         conexao.close()
         return
 
-    time.sleep(DELAY_ENTRE_REQUISICOES)   # educacao com o servidor
+    # (Nao ha mais uma pausa extra aqui: a "educacao com o servidor" ja
+    # acontece DENTRO de buscar_lancamentos, entre uma pagina e outra.
+    # Uma pausa depois que a resposta ja chegou so atrasa voce a toa.)
 
     # Passo 2: converter para o formato do bot
     itens = extrair_itens(registros)
@@ -1108,20 +1194,6 @@ def rodar_coleta(config: dict) -> None:
 
     log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
 
-    # Passo 4.5: traduzir os titulos dos novos para portugues.
-    # So os NOVOS sao traduzidos — os 50 da primeira rodada nao gastam cota.
-    if novos and config["traduzir"]:
-        log.info("Traduzindo %s titulo(s) para portugues...", len(novos))
-        for item in novos:
-            item["titulo_pt"] = traduzir(
-                item["titulo"], conexao, config["traducao_email"]
-            )
-            conexao.execute(
-                "UPDATE itens SET titulo_pt = ? WHERE id = ?",
-                (item["titulo_pt"], item["id"]),
-            )
-        conexao.commit()
-
     # Aviso util: se TODOS os produtos lidos forem novos, e sinal de que
     # sairam mais lancamentos do que o bot consegue ver por rodada.
     if novos and len(novos) == len(itens) and not profunda:
@@ -1150,6 +1222,19 @@ def rodar_coleta(config: dict) -> None:
             )
 
         for numero, item in enumerate(a_enviar, 1):
+            # Traduz agora, na hora de enviar — nao antes, em lote (isso
+            # atrasaria o item 1 esperando a traducao dos itens 2, 3, 4...)
+            if config["traduzir"] and not item.get("titulo_pt"):
+                item["titulo_pt"] = traduzir(
+                    item["titulo"], conexao, config["traducao_email"]
+                )
+                conexao.execute(
+                    "UPDATE itens SET titulo_pt = ? WHERE id = ?",
+                    (item["titulo_pt"], item["id"]),
+                )
+                conexao.commit()
+            item.setdefault("publicado_em", datetime.now(timezone.utc))
+
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
             if notificar(item, config):
                 marcar_notificado(conexao, item["id"])
@@ -1275,14 +1360,14 @@ def rodar_coleta_arquivo(config: dict) -> None:
             len(novos), MAX_NOTIFICACOES_POR_RODADA,
         )
 
-    # Traduz so os que serao enviados agora
-    if config["traduzir"]:
-        log.info("Traduzindo %s titulo(s) para portugues...", len(a_enviar))
-        for item in a_enviar:
-            item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
-
+    # Traduz e avisa CADA item na hora, um de cada vez — em vez de traduzir
+    # o lote inteiro primeiro e so depois comecar a enviar. Assim o primeiro
+    # lancamento chega no Discord sem esperar a traducao dos outros.
     erros = 0
     for numero, item in enumerate(a_enviar, 1):
+        if config["traduzir"]:
+            item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
+        item["publicado_em"] = datetime.now(timezone.utc)
         log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
         if notificar(item, config):
             ja_vistos.append(item["id"])
@@ -1691,7 +1776,7 @@ def assistente_configuracao() -> None:
     print("    2 - Telegram")
     escolha = _perguntar("  Digite 1 ou 2: ")
 
-    valores = {"TRADUZIR": "sim", "TRADUCAO_EMAIL": "", "CATEGORIA_ID": ""}
+    valores = {"TRADUZIR": "nao", "TRADUCAO_EMAIL": "", "CATEGORIA_ID": ""}
 
     # ------------------------------- DISCORD -------------------------------
     if escolha == "1":
