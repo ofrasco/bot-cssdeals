@@ -27,6 +27,7 @@ import urllib.robotparser
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -58,6 +59,12 @@ SITE_BASE = "https://cssdeals.com"
 
 # Endereco da lista de produtos (a API interna do proprio site)
 API_PRODUTOS = SITE_BASE + "/api/product"
+
+# Endereco dos detalhes de UM produto especifico — e aqui, e so aqui, que
+# vem as fotos REAIS da pagina do produto (campo "images"), a variacao
+# escolhida (cor/tamanho) e o link de origem. A lista (API_PRODUTOS) nao
+# traz nada disso, so o titulo/preco/capa.
+API_PRODUTO_DETALHE = SITE_BASE + "/api/product/{id}"
 
 # Quantos produtos ler por rodada (do mais novo para o mais antigo).
 # 50 da uma margem folgada: mesmo que o site cadastre varios produtos
@@ -111,9 +118,22 @@ ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
 # minuto, enquanto o site publica ~2 produtos a cada 15 minutos.
 # O valor real e lido do .env em carregar_config() — este e so o padrao.
 INTERVALO_PADRAO = 60
+
+# --- Janela de rastreio mais rapido ---
+# Entre JANELA_RAPIDA_INICIO e JANELA_RAPIDA_FIM (horario de Brasilia), o
+# bot verifica o site a cada INTERVALO_RAPIDO_SEGUNDOS em vez do intervalo
+# normal (config["intervalo"] / INTERVALO_SEGUNDOS). Fora desse horario,
+# continua no intervalo normal de sempre.
+FUSO_HORARIO_JANELA = ZoneInfo("America/Sao_Paulo")
+JANELA_RAPIDA_INICIO = 4      # 04:00 (inclui)
+JANELA_RAPIDA_FIM = 9         # 09:00 (nao inclui — ou seja, vale ate 08:59:59)
+INTERVALO_RAPIDO_SEGUNDOS = 30
 DELAY_ENTRE_REQUISICOES = 1.5     # (sem uso no momento — ver DELAY_ENTRE_PAGINAS)
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
+TIMEOUT_DETALHE = 6               # timeout CURTO para a busca de fotos reais —
+                                   # se o site demorar, seguimos com a capa em
+                                   # vez de travar o aviso esperando
 MAX_TENTATIVAS = 3                # quantas vezes tentar de novo se der erro
 MAX_NOTIFICACOES_POR_RODADA = 20  # trava de seguranca contra spam
 MAX_IMAGENS_DISCORD = 4           # quantas fotos no maximo mostrar na galeria do Discord
@@ -442,22 +462,19 @@ def montar_item(registro: dict) -> Optional[dict]:
     if not titulo:
         titulo = "(produto sem titulo)"
 
-    # Fotos: prioridade e SEMPRE para as fotos das variacoes (skus) do
-    # produto — sao as mesmas que aparecem na PROPRIA PAGINA DO PRODUTO,
-    # podendo ter uma ou varias (uma por cor/variacao). Só usamos a capa
-    # (campo "thumbnail", a foto da pagina inicial/lista do site) se o
-    # produto nao tiver NENHUMA foto de variacao.
+    # Fotos: a lista de produtos (API_PRODUTOS) so traz a capa (campo
+    # "thumbnail") — descobrimos que "skus[].image" NAO e uma foto real do
+    # produto, e sim uma imagem de referencia interna do fornecedor (outro
+    # dominio, geralmente nem bate com o produto certo). As fotos DE
+    # VERDADE, as mesmas que aparecem dentro da pagina do produto, só vem
+    # de uma segunda chamada (veja enriquecer_com_detalhes mais abaixo),
+    # feita so para os itens novos, na hora de avisar.
     skus = registro.get("skus") or []
     primeiro_sku = skus[0] if skus else {}
     imagens = []
-    for sku in skus:
-        candidata = str(sku.get("image") or "").strip()
-        if candidata and candidata not in imagens:
-            imagens.append(candidata)
-    if not imagens:
-        capa = str(registro.get("thumbnail") or "").strip()
-        if capa:
-            imagens.append(capa)
+    capa = str(registro.get("thumbnail") or "").strip()
+    if capa:
+        imagens.append(capa)
     imagem = imagens[0] if imagens else ""
 
     # Preco: a API devolve em yuan; converte para real tambem
@@ -474,6 +491,7 @@ def montar_item(registro: dict) -> Optional[dict]:
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
         "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
         "origem": str(registro.get("sourceLink") or "").strip(),
+        "variacao": "",                                     # cor/tamanho — preenchido depois
     }
 
 
@@ -485,6 +503,61 @@ def extrair_itens(registros: list) -> list:
         if item:
             itens.append(item)
     return itens
+
+
+def buscar_detalhe_produto(sessao: requests.Session, produto_id: str) -> Optional[dict]:
+    """
+    Busca os detalhes de UM produto especifico — as fotos reais da pagina
+    dele, a variacao (cor/tamanho) e o link de origem.
+
+    Usa um timeout CURTO (TIMEOUT_DETALHE) de proposito: isto roda na hora
+    de avisar, entao se o site demorar, desistimos rapido e mandamos o
+    aviso do mesmo jeito, so que com a capa em vez das fotos reais — nunca
+    vale a pena atrasar o aviso esperando essa chamada extra.
+    """
+    try:
+        resposta = sessao.get(
+            API_PRODUTO_DETALHE.format(id=produto_id), timeout=TIMEOUT_DETALHE,
+        )
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.warning("Nao consegui buscar os detalhes de %s (%s). Usando a capa.", produto_id, erro)
+        return None
+
+    if corpo.get("code") != 0:
+        return None
+
+    return corpo.get("data") or None
+
+
+def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
+    """
+    Completa o item com as fotos reais, a variacao (cor/tamanho) e o link
+    de origem, buscando na pagina do proprio produto.
+
+    Se essa busca falhar por qualquer motivo, o item fica como estava (com
+    a capa) — nunca impede o aviso de ser enviado.
+    """
+    detalhe = buscar_detalhe_produto(sessao, item["id"])
+    if not detalhe:
+        return
+
+    fotos_reais = [
+        str(foto.get("url") or "").strip()
+        for foto in (detalhe.get("images") or [])
+        if str(foto.get("url") or "").strip()
+    ]
+    if fotos_reais:
+        item["imagens"] = fotos_reais
+        item["imagem"] = fotos_reais[0]
+
+    skus = detalhe.get("skus") or []
+    if skus:
+        item["variacao"] = str(skus[0].get("skuNames") or "").strip()
+        origem = str(skus[0].get("sourceLink") or "").strip()
+        if origem:
+            item["origem"] = origem
 
 
 # ==========================================================================
@@ -781,8 +854,14 @@ def montar_texto_telegram(item: dict) -> str:
     if item.get("preco"):
         linhas.append("Preco: <b>{}</b>".format(escapar_html(item["preco"])))
 
+    if item.get("variacao"):
+        linhas.append("🎨 {}".format(escapar_html(item["variacao"])))
+
     if item.get("link"):
         linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
+
+    if item.get("origem"):
+        linhas.append('<a href="{}">🛒 Comprar Agora (link de origem)</a>'.format(item["origem"]))
 
     if item.get("publicado_em"):
         horario = item["publicado_em"].strftime("%d/%m/%Y %H:%M UTC")
@@ -960,6 +1039,8 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     etiquetas = [e for e in (item.get("categoria"), item.get("plataforma")) if e]
     if etiquetas:
         detalhes.append(" · ".join(etiquetas))
+    if item.get("variacao"):
+        detalhes.append("🎨 {}".format(item["variacao"]))
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
@@ -971,11 +1052,33 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         for extra in imagens[1:MAX_IMAGENS_DISCORD]:
             embeds.append({"url": item["link"], "image": {"url": extra}})
 
+    # Botoes (link direto, sem precisar clicar no titulo pequeno do embed) —
+    # agiliza a compra. Sao botoes do tipo "link": so abrem uma URL, nao
+    # precisam de nenhum bot rodando por tras, entao funcionam com qualquer
+    # Webhook comum do Discord.
+    botoes = []
+    if item.get("origem"):
+        botoes.append({"type": 2, "style": 5, "label": "🛒 Comprar Agora", "url": item["origem"]})
+    if item.get("link"):
+        botoes.append({"type": 2, "style": 5, "label": "📄 Ver no CSSDeals", "url": item["link"]})
+    componentes = [{"type": 1, "components": botoes}] if botoes else []
+
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            resposta = requests.post(
-                webhook_url, json={"embeds": embeds}, timeout=TIMEOUT
-            )
+            payload = {"embeds": embeds}
+            if componentes:
+                payload["components"] = componentes
+            resposta = requests.post(webhook_url, json=payload, timeout=TIMEOUT)
+
+            # Se o Discord recusar por causa dos botoes (webhook antigo,
+            # sem suporte a componentes), tenta de novo so com os embeds —
+            # melhor mandar sem botao do que nao mandar nada.
+            if resposta.status_code == 400 and componentes:
+                log.warning("Discord recusou os botoes — mandando sem eles.")
+                componentes = []
+                resposta = requests.post(
+                    webhook_url, json={"embeds": embeds}, timeout=TIMEOUT
+                )
 
             if resposta.status_code in (200, 204):
                 return True
@@ -1233,6 +1336,12 @@ def rodar_coleta(config: dict) -> None:
                     (item["titulo_pt"], item["id"]),
                 )
                 conexao.commit()
+
+            # Busca as fotos reais/variacao/link de origem na pagina do
+            # produto. Tem timeout curto (TIMEOUT_DETALHE) — se travar ou
+            # falhar, segue com a capa mesmo, nunca atrasa o aviso.
+            enriquecer_com_detalhes(sessao, item)
+
             item.setdefault("publicado_em", datetime.now(timezone.utc))
 
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
@@ -1255,6 +1364,23 @@ def rodar_coleta(config: dict) -> None:
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
+
+
+def intervalo_atual(config: dict) -> int:
+    """
+    Decide quantos segundos esperar ate a proxima rodada.
+
+    Entre JANELA_RAPIDA_INICIO e JANELA_RAPIDA_FIM (horario de Brasilia),
+    usa INTERVALO_RAPIDO_SEGUNDOS (rastreio mais rapido, ideal pra horario
+    de lancamento). Fora dessa janela, usa o intervalo normal configurado
+    (config["intervalo"] / variavel INTERVALO_SEGUNDOS).
+    """
+    agora_brasil = datetime.now(FUSO_HORARIO_JANELA)
+
+    if JANELA_RAPIDA_INICIO <= agora_brasil.hour < JANELA_RAPIDA_FIM:
+        return INTERVALO_RAPIDO_SEGUNDOS
+
+    return config["intervalo"]
 
 
 def paginas_desta_rodada(primeira_vez: bool) -> tuple:
@@ -1311,12 +1437,13 @@ def rodar_coleta_arquivo(config: dict) -> None:
     conjunto = set(ja_vistos)
     primeira_vez = not ja_vistos
 
+    sessao = criar_sessao()
     paginas, profunda = paginas_desta_rodada(primeira_vez)
     if profunda:
         log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
                  paginas, paginas * TAMANHO_PAGINA)
 
-    registros = buscar_lancamentos(criar_sessao(), config["categoria"], paginas)
+    registros = buscar_lancamentos(sessao, config["categoria"], paginas)
     if registros is None:
         log.error("Rodada abortada: nao consegui falar com o site.")
         return
@@ -1367,6 +1494,12 @@ def rodar_coleta_arquivo(config: dict) -> None:
     for numero, item in enumerate(a_enviar, 1):
         if config["traduzir"]:
             item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
+
+        # Busca as fotos reais/variacao/link de origem na pagina do
+        # produto. Tem timeout curto (TIMEOUT_DETALHE) — se travar ou
+        # falhar, segue com a capa mesmo, nunca atrasa o aviso.
+        enriquecer_com_detalhes(sessao, item)
+
         item["publicado_em"] = datetime.now(timezone.utc)
         log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
         if notificar(item, config):
@@ -1926,9 +2059,14 @@ def main() -> None:
 
     if argumentos.loop:
         log.info(
-            "MODO CONTINUO ligado — verificando a cada %s segundos.",
+            "MODO CONTINUO ligado — verificando a cada %s segundos "
+            "(entre %02dh e %02dh, horario de Brasilia, verifica a cada "
+            "%s segundos).",
             config["intervalo"],
+            JANELA_RAPIDA_INICIO, JANELA_RAPIDA_FIM, INTERVALO_RAPIDO_SEGUNDOS,
         )
+
+        janela_rapida_ativa_antes = False
         while True:
             try:
                 executar_rodada(config)
@@ -1936,7 +2074,24 @@ def main() -> None:
                 # Blindagem final: nada derruba o loop
                 log.exception("Erro inesperado na rodada: %s", erro)
 
-            time.sleep(config["intervalo"])
+            espera = intervalo_atual(config)
+
+            janela_rapida_ativa = espera == INTERVALO_RAPIDO_SEGUNDOS
+            if janela_rapida_ativa != janela_rapida_ativa_antes:
+                if janela_rapida_ativa:
+                    log.info(
+                        "Entrando na janela rapida (%02dh-%02dh): "
+                        "rastreio a cada %ss.",
+                        JANELA_RAPIDA_INICIO, JANELA_RAPIDA_FIM, espera,
+                    )
+                else:
+                    log.info(
+                        "Saindo da janela rapida: rastreio volta a cada %ss.",
+                        espera,
+                    )
+                janela_rapida_ativa_antes = janela_rapida_ativa
+
+            time.sleep(espera)
     else:
         executar_rodada(config)
 
