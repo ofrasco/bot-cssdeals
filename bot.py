@@ -71,6 +71,19 @@ API_PRODUTO_DETALHE = SITE_BASE + "/api/product/{id}"
 # em 15 minutos, nenhum passa despercebido.
 TAMANHO_PAGINA = 100          # maximo aceito pela API (acima disso ela devolve 20!)
 
+# Paginas da leitura RAPIDA (a de cada ciclo normal, nao a profunda).
+# Com 1 pagina so (100 produtos), lancamentos que entram mais pra baixo
+# da lista nessa hora podem escapar por pouco. 2 paginas (200 produtos)
+# da bem mais margem, ao custo de 1 requisicao a mais por ciclo.
+PAGINAS_RAPIDAS = 2
+
+# Quantas paginas buscar AO MESMO TEMPO (em paralelo), tanto na leitura
+# rapida quanto na varredura profunda. Nao aumenta o numero de
+# requisicoes — so evita que uma espere a outra terminar. Numa varredura
+# de 10 paginas, por exemplo, o tempo total cai de ~15s (sequencial) para
+# uns ~4s (paralelo), o que sai direto do seu atraso ate ser avisado.
+PAGINAS_SIMULTANEAS = 4
+
 # --- Varredura profunda ---
 #  A API ordena por ID, que e a ordem de CRIACAO do produto — nao a de
 #  publicacao. O cssdeals as vezes torna visivel um produto criado ha
@@ -82,10 +95,30 @@ TAMANHO_PAGINA = 100          # maximo aceito pela API (acima disso ela devolve 
 #  independentemente da posicao.
 PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 MINUTOS_ENTRE_VARREDURAS = 20
-DELAY_ENTRE_PAGINAS = 1.5
+DELAY_ENTRE_PAGINAS = 1.5     # (sem uso no momento — as paginas agora vao em paralelo)
 
 # Pagina do link de compra de cada produto
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
+
+# O servidor de imagens do CSSDeals (Aliyun OSS) sabe redimensionar pela
+# propria URL, so acrescentando esse parametro no final. A foto original
+# chega a ~3 MB; com isso cai pra ~80 KB — o Telegram BAIXA a imagem a
+# cada envio, entao foto grande atrasa a entrega da mensagem.
+REDIMENSIONA_FOTO = "?x-oss-process=image/resize,w_800/quality,Q_80"
+
+# Link do botao "BUY NOW" do proprio site: manda direto pro carrinho do
+# CSSBuy (o agente de compra por tras do CSSDeals). Montamos isso sem
+# NENHUMA requisicao extra — so precisa do id do produto, que ja temos
+# assim que o item e detectado.
+URL_COMPRA = "https://www.cssbuy.com/waiting?type=cssdeals&productId={id}&quantity=1"
+
+# Trecho extra colado no fim do link de compra — para o SEU codigo de
+# indicacao do CSSBuy, caso tenha um (gera comissao quando alguem compra
+# por esse link). Configure em CSSBUY_EXTRA no Railway/.env, exatamente
+# como aparece no seu link de indicacao, por exemplo:
+#     &promotecode=SEUCODIGO
+# Deixe vazio (padrao) para nao acrescentar nada.
+CSSBUY_EXTRA = os.getenv("CSSBUY_EXTRA", "").strip()
 
 # Nome de cada plataforma de origem (vem no campo salePlatform)
 PLATAFORMAS = {1: "Taobao", 2: "Weidian", 3: "1688"}
@@ -119,15 +152,19 @@ ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
 # O valor real e lido do .env em carregar_config() — este e so o padrao.
 INTERVALO_PADRAO = 60
 
-# --- Janela de rastreio mais rapido ---
+# --- Janela de rastreio mais rapido ("pico") ---
 # Entre JANELA_RAPIDA_INICIO e JANELA_RAPIDA_FIM (horario de Brasilia), o
 # bot verifica o site a cada INTERVALO_RAPIDO_SEGUNDOS em vez do intervalo
-# normal (config["intervalo"] / INTERVALO_SEGUNDOS). Fora desse horario,
-# continua no intervalo normal de sempre.
+# normal. Fora desse horario, continua no intervalo normal de sempre.
+#
+# Os tres valores dao pra ajustar via variavel de ambiente (Railway/.env),
+# sem precisar mexer no codigo — ver JANELA_RAPIDA_INICIO/FIM/
+# INTERVALO_RAPIDO_SEGUNDOS em carregar_config(). A janela pode atravessar
+# a meia-noite (ex: 22:00 as 09:00) sem problema.
 FUSO_HORARIO_JANELA = ZoneInfo("America/Sao_Paulo")
-JANELA_RAPIDA_INICIO = 4      # 04:00 (inclui)
-JANELA_RAPIDA_FIM = 9         # 09:00 (nao inclui — ou seja, vale ate 08:59:59)
-INTERVALO_RAPIDO_SEGUNDOS = 30
+JANELA_RAPIDA_INICIO_PADRAO = "22:00"
+JANELA_RAPIDA_FIM_PADRAO = "09:00"
+INTERVALO_RAPIDO_PADRAO = 30
 DELAY_ENTRE_REQUISICOES = 1.5     # (sem uso no momento — ver DELAY_ENTRE_PAGINAS)
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
@@ -169,12 +206,30 @@ USER_AGENT = "BotColetaPessoal/1.0 (uso pessoal; contato via Telegram)"
 #  3. LOG (mostra o progresso na tela e salva no arquivo bot.log)
 # ==========================================================================
 
+# Padroes que parecem token/webhook — trocados por "<OCULTO>" antes de
+# qualquer linha ir pra tela ou pro arquivo de log. Protege caso voce
+# precise colar um trecho do log pra pedir ajuda em algum lugar publico.
+_SEGREDOS_NO_LOG = [
+    (re.compile(r"\d{6,12}:[A-Za-z0-9_-]{30,}"), "<TOKEN-OCULTO>"),               # token do Telegram
+    (re.compile(r"(discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9_-]+"), r"\1<OCULTO>"),  # webhook do Discord
+]
+
+
+class FormatoSemSegredos(logging.Formatter):
+    """Formatter que remove tokens/webhooks das mensagens antes de logar."""
+    def format(self, record):
+        texto = super().format(record)
+        for padrao, troca in _SEGREDOS_NO_LOG:
+            texto = padrao.sub(troca, texto)
+        return texto
+
+
 def configurar_log() -> logging.Logger:
     logger = logging.getLogger("bot")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    formato = logging.Formatter(
+    formato = FormatoSemSegredos(
         "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%d/%m/%Y %H:%M:%S"
     )
 
@@ -336,8 +391,20 @@ def robots_permite(url: str) -> bool:
     """
     Le o robots.txt do site e confere se o bot tem permissao de acessar.
 
-    E o equivalente a bater na porta antes de entrar. Se nao conseguir ler o
-    robots.txt, assume que pode (comportamento padrao da internet).
+    IMPORTANTE (corrigido em 16/09/2026): antes, chamavamos leitor.read(),
+    que busca o robots.txt por baixo dos panos usando o User-Agent padrao
+    do Python ("Python-urllib/x.y"). O Cloudflare do cssdeals passou a
+    bloquear esse User-Agent generico (HTTP 403) — e a biblioteca padrao
+    do Python, ao receber 401/403, tem uma regra antiga que trata isso
+    como "o site proibe TUDO", mesmo que o robots.txt de verdade nao
+    proiba nada. Resultado: o bot parava de avisar sem o site ter
+    proibido nada de fato.
+
+    A correcao: buscamos o robots.txt NOS MESMOS, com o nosso proprio
+    User-Agent (o mesmo usado em todas as outras requisicoes), e so
+    entao entregamos o conteudo para o leitor interpretar. Alem disso,
+    seguimos a RFC 9309: se o robots.txt vier com erro 4xx (nao existe),
+    tratamos como "sem restricoes" em vez de "proibido".
 
     O resultado fica em cache por _VALIDADE_CACHE_ROBOTS segundos: nao faz
     sentido reler o robots.txt a cada rodada, ja que ele quase nunca muda.
@@ -348,19 +415,37 @@ def robots_permite(url: str) -> bool:
     if em_cache and (time.time() - em_cache[1]) < _VALIDADE_CACHE_ROBOTS:
         return em_cache[0]
 
+    leitor = urllib.robotparser.RobotFileParser()
     try:
-        leitor = urllib.robotparser.RobotFileParser()
-        leitor.set_url(urljoin(base, "/robots.txt"))
-        leitor.read()
-        permitido = leitor.can_fetch(USER_AGENT, url)
-        if not permitido:
-            log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
-        _cache_robots[base] = (permitido, time.time())
-        return permitido
+        resposta = requests.get(
+            urljoin(base, "/robots.txt"),
+            headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT,
+        )
+        if resposta.status_code == 200:
+            leitor.parse(resposta.text.splitlines())
+        elif 400 <= resposta.status_code < 500:
+            # Arquivo nao existe / bloqueado por engano -> sem restricoes
+            log.warning(
+                "robots.txt respondeu HTTP %s. Seguindo sem restricoes.",
+                resposta.status_code,
+            )
+            leitor.parse([])
+        else:
+            # Erro do lado do site (5xx): nao da pra saber, segue com cautela
+            log.warning(
+                "robots.txt respondeu HTTP %s. Seguindo com cautela.",
+                resposta.status_code,
+            )
+            leitor.parse([])
     except Exception as erro:
         log.warning("Nao consegui ler o robots.txt (%s). Seguindo com cautela.", erro)
-        _cache_robots[base] = (True, time.time())
-        return True
+        leitor.parse([])
+
+    permitido = leitor.can_fetch(USER_AGENT, url)
+    if not permitido:
+        log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
+    _cache_robots[base] = (permitido, time.time())
+    return permitido
 
 
 def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
@@ -380,69 +465,90 @@ def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
     return None
 
 
+def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int) -> tuple:
+    """Busca UMA pagina da API. Devolve (numero, registros) ou (numero, None) se falhar."""
+    parametros = {
+        "fields": 1,
+        "categoryId": categoria,
+        "page": numero,
+        "pageSize": TAMANHO_PAGINA,
+        "priceMin": "0.00",
+        "priceMax": "99999.00",
+    }
+
+    try:
+        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except requests.exceptions.Timeout:
+        log.error("Timeout na pagina %s (%ss).", numero, TIMEOUT)
+        return numero, None
+    except requests.exceptions.ConnectionError:
+        log.error("Conexao recusada ou sem internet (pagina %s).", numero)
+        return numero, None
+    except requests.exceptions.HTTPError as erro:
+        log.error("O site respondeu com erro na pagina %s: %s", numero, erro)
+        return numero, None
+    except ValueError:
+        log.error("O site respondeu algo que nao e JSON na pagina %s.", numero)
+        return numero, None
+    except Exception as erro:
+        log.error("Erro inesperado na pagina %s: %s", numero, erro)
+        return numero, None
+
+    if corpo.get("code") != 0:
+        log.error("A API recusou a pagina %s: %s", numero, corpo.get("msg") or corpo.get("code"))
+        return numero, None
+
+    dados = corpo.get("data") or {}
+    if numero == 1 and dados.get("total") is not None:
+        log.info("Catalogo do site tem %s produtos no total.", dados["total"])
+
+    return numero, (dados.get("records") or [])
+
+
 def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
                        paginas: int = 1) -> Optional[list]:
     """
     Pergunta a API do site quais produtos existem, do mais recente para o
     mais antigo.
 
-    `paginas=1` e a leitura rapida de rotina (so o topo).
-    `paginas=10` e a varredura profunda, que procura produtos que ficaram
-    visiveis agora mas foram criados ha dias — esses nascem no meio da
-    lista e o topo nunca os mostra.
+    `paginas=1` e a leitura mais enxuta possivel. `PAGINAS_RAPIDAS` (2) e
+    a leitura de rotina de cada ciclo. `PAGINAS_PROFUNDAS` (10) e a
+    varredura funda, que procura produtos que ficaram visiveis agora mas
+    foram criados ha dias — esses nascem no meio da lista e o topo nunca
+    os mostra.
+
+    Quando pede mais de 1 pagina, busca todas AO MESMO TEMPO (em paralelo,
+    ate PAGINAS_SIMULTANEAS por vez) em vez de uma de cada vez — o mesmo
+    numero de requisicoes, so que sem ficar esperando fila.
     """
+    if paginas <= 1:
+        _, registros = _buscar_pagina(sessao, categoria, 1)
+        return registros
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    resultados = {}
+    with ThreadPoolExecutor(max_workers=PAGINAS_SIMULTANEAS) as executor:
+        tarefas = [executor.submit(_buscar_pagina, sessao, categoria, n)
+                   for n in range(1, paginas + 1)]
+        for tarefa in tarefas:
+            numero, registros = tarefa.result()
+            resultados[numero] = registros
+
+    # Remonta na ordem certa (1, 2, 3...) e para na primeira pagina que
+    # falhou ou veio incompleta (sinal de que chegamos ao fim do catalogo).
     todos = []
-
     for numero in range(1, paginas + 1):
-        parametros = {
-            "fields": 1,
-            "categoryId": categoria,
-            "page": numero,
-            "pageSize": TAMANHO_PAGINA,
-            "priceMin": "0.00",
-            "priceMax": "99999.00",
-        }
-
-        try:
-            resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
-            resposta.raise_for_status()
-            corpo = resposta.json()
-        except requests.exceptions.Timeout:
-            log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
-            return todos or None
-        except requests.exceptions.ConnectionError:
-            log.error("Conexao recusada ou sem internet.")
-            return todos or None
-        except requests.exceptions.HTTPError as erro:
-            log.error("O site respondeu com erro: %s", erro)
-            return todos or None
-        except ValueError:
-            log.error("O site respondeu algo que nao e JSON (a API pode ter mudado).")
-            return todos or None
-        except Exception as erro:
-            log.error("Erro inesperado ao consultar a API: %s", erro)
-            return todos or None
-
-        if corpo.get("code") != 0:
-            log.error("A API recusou a consulta: %s", corpo.get("msg") or corpo.get("code"))
-            return todos or None
-
-        dados = corpo.get("data") or {}
-        registros = dados.get("records") or []
-
-        if numero == 1 and dados.get("total") is not None:
-            log.info("Catalogo do site tem %s produtos no total.", dados["total"])
-
+        registros = resultados.get(numero)
+        if registros is None:
+            break
         todos.extend(registros)
-
-        # Pagina veio incompleta = chegamos ao fim do catalogo
         if len(registros) < TAMANHO_PAGINA:
             break
 
-        if numero < paginas:
-            time.sleep(DELAY_ENTRE_PAGINAS)   # educacao com o servidor
-
-    return todos
+    return todos or None
 
 
 def montar_item(registro: dict) -> Optional[dict]:
@@ -486,7 +592,8 @@ def montar_item(registro: dict) -> Optional[dict]:
         "titulo_pt": "",                                    # preenchido depois
         "imagem": imagem,                                   # foto principal (compatibilidade)
         "imagens": imagens,                                 # todas as fotos, na ordem
-        "link": URL_PRODUTO.format(id=produto_id),          # link de compra
+        "link": URL_PRODUTO.format(id=produto_id),          # pagina do produto
+        "link_compra": URL_COMPRA.format(id=produto_id) + CSSBUY_EXTRA,  # botao "comprar agora"
         "preco": preco,
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
         "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
@@ -544,7 +651,7 @@ def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
         return
 
     fotos_reais = [
-        str(foto.get("url") or "").strip()
+        str(foto.get("url") or "").strip() + REDIMENSIONA_FOTO
         for foto in (detalhe.get("images") or [])
         if str(foto.get("url") or "").strip()
     ]
@@ -558,6 +665,122 @@ def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
         origem = str(skus[0].get("sourceLink") or "").strip()
         if origem:
             item["origem"] = origem
+
+
+def buscar_por_titulo(termo: str, quantos: int = 10) -> list:
+    """Procura no catalogo produtos cujo titulo contenha o termo (a propria API filtra)."""
+    parametros = {
+        "fields": 1, "categoryId": "", "page": 1, "pageSize": quantos,
+        "priceMin": "0.00", "priceMax": "99999.00", "title": termo,
+    }
+    try:
+        resposta = requests.get(
+            API_PRODUTOS, params=parametros,
+            headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT,
+        )
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.error("Busca falhou: %s", erro)
+        return []
+    if corpo.get("code") != 0:
+        log.error("A API recusou a busca: %s", corpo.get("msg"))
+        return []
+    return (corpo.get("data") or {}).get("records") or []
+
+
+def comando_buscar(termo: str) -> None:
+    """Comando de terminal (--buscar "termo"): mostra os produtos achados com TODAS as fotos."""
+    print()
+    print("=" * 66)
+    print("  BUSCA: {}".format(termo))
+    print("=" * 66)
+
+    achados = buscar_por_titulo(termo)
+    if not achados:
+        print()
+        print("  Nenhum produto encontrado com esse texto no titulo.")
+        print("  Tente um trecho menor, ou uma palavra so.")
+        print()
+        return
+
+    sessao = criar_sessao()
+    for numero, registro in enumerate(achados, 1):
+        item = montar_item(registro) or {}
+        detalhe = buscar_detalhe_produto(sessao, registro.get("id", "")) or {}
+        fotos = [f.get("url") for f in (detalhe.get("images") or []) if f.get("url")]
+        sku = (detalhe.get("skus") or registro.get("skus") or [{}])[0]
+
+        print()
+        print("  {}. {}".format(numero, (registro.get("title") or "")[:60]))
+        print("     {}   tamanho {}   estoque {}".format(
+            montar_preco(sku.get("price")) or "?", sku.get("size") or "-",
+            sku.get("quantity", "?"),
+        ))
+        print("     {}".format(item.get("link", "")))
+        if fotos:
+            print("     FOTOS ({}):".format(len(fotos)))
+            for foto in fotos:
+                print("       {}".format(foto))
+        else:
+            print("     (sem fotos no detalhe)")
+
+    print()
+    print("=" * 66)
+    print("  As imagens continuam acessiveis mesmo se o anuncio sair do ar.")
+    print("  Salve os enderecos acima se quiser guardar.")
+    print("=" * 66)
+
+
+def testar_rede() -> None:
+    """
+    Comando de terminal (--testar-rede): confere se ESTE servidor alcanca
+    cada servico usado pelo bot, por IPv4 e por IPv6 separadamente.
+
+    Existe porque a mensagem de erro do Python engana: quando o IPv4
+    demora e o IPv6 nao tem rota (ou vice-versa), so aparece o ULTIMO
+    erro tentado, escondendo qual dos dois realmente falhou.
+    """
+    import socket
+
+    def alcanca(host: str, familia) -> str:
+        try:
+            enderecos = socket.getaddrinfo(host, 443, familia, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return "sem endereco nesse protocolo"
+        for af, tipo, proto, _, destino in enderecos[:2]:
+            sock = socket.socket(af, tipo, proto)
+            sock.settimeout(5)
+            try:
+                sock.connect(destino)
+                return "OK"
+            except OSError as erro:
+                return "falhou ({})".format(erro)
+            finally:
+                sock.close()
+        return "sem endereco nesse protocolo"
+
+    print()
+    print("=" * 66)
+    print("  DIAGNOSTICO DE REDE")
+    print("=" * 66)
+
+    hosts = [
+        ("cssdeals.com", urlparse(SITE_BASE).netloc),
+        ("api.telegram.org", "api.telegram.org"),
+        ("discord.com", "discord.com"),
+    ]
+    for nome, host in hosts:
+        print()
+        print("  {}:".format(nome))
+        print("     IPv4: {}".format(alcanca(host, socket.AF_INET)))
+        print("     IPv6: {}".format(alcanca(host, socket.AF_INET6)))
+
+    print()
+    print("=" * 66)
+    print("  Se um servico falha so no IPv6, o problema costuma ser o")
+    print("  provedor de hospedagem (falta de rota), nao o seu codigo.")
+    print("=" * 66)
 
 
 # ==========================================================================
@@ -858,10 +1081,16 @@ def montar_texto_telegram(item: dict) -> str:
         linhas.append("🎨 {}".format(escapar_html(item["variacao"])))
 
     if item.get("link"):
-        linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
+        linhas.append('<a href="{}">📄 Ver no CSSDeals</a>'.format(item["link"]))
 
+    if item.get("link_compra"):
+        linhas.append('<a href="{}">🛒 Comprar Agora</a>'.format(item["link_compra"]))
+
+    # Link de origem em TEXTO puro (nao so como link clicavel): fica
+    # pesquisavel no historico da conversa, pra achar depois qual
+    # vendedor tinha o produto.
     if item.get("origem"):
-        linhas.append('<a href="{}">🛒 Comprar Agora (link de origem)</a>'.format(item["origem"]))
+        linhas.append("🔗 Origem: {}".format(escapar_html(item["origem"])))
 
     if item.get("publicado_em"):
         horario = item["publicado_em"].strftime("%d/%m/%Y %H:%M UTC")
@@ -1041,6 +1270,10 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         detalhes.append(" · ".join(etiquetas))
     if item.get("variacao"):
         detalhes.append("🎨 {}".format(item["variacao"]))
+    # Link de origem em TEXTO (nao so no botao): assim fica no historico
+    # do canal, dando pra pesquisar depois qual vendedor tinha o produto.
+    if item.get("origem"):
+        detalhes.append("🔗 Origem: {}".format(item["origem"]))
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
@@ -1057,10 +1290,12 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     # precisam de nenhum bot rodando por tras, entao funcionam com qualquer
     # Webhook comum do Discord.
     botoes = []
-    if item.get("origem"):
-        botoes.append({"type": 2, "style": 5, "label": "🛒 Comprar Agora", "url": item["origem"]})
+    if item.get("link_compra"):
+        botoes.append({"type": 2, "style": 5, "label": "🛒 Comprar Agora", "url": item["link_compra"]})
     if item.get("link"):
         botoes.append({"type": 2, "style": 5, "label": "📄 Ver no CSSDeals", "url": item["link"]})
+    if item.get("origem"):
+        botoes.append({"type": 2, "style": 5, "label": "🔗 Fornecedor Original", "url": item["origem"]})
     componentes = [{"type": 1, "components": botoes}] if botoes else []
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
@@ -1156,6 +1391,20 @@ def _inteiro_do_ambiente(nome: str, padrao: int) -> int:
     return valor
 
 
+def _minutos_do_dia(texto: str, padrao: str) -> int:
+    """Converte 'HH:MM' em minutos desde a meia-noite. Se vier invalido, usa o padrao."""
+    try:
+        h, m = texto.strip().split(":")
+        h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        return h * 60 + m
+    except (ValueError, AttributeError):
+        log.warning("Horario '%s' invalido (use HH:MM). Usando %s.", texto, padrao)
+        h, m = padrao.split(":")
+        return int(h) * 60 + int(m)
+
+
 def carregar_config() -> dict:
     """Le o arquivo .env e confere se pelo menos um canal foi configurado."""
     load_dotenv()
@@ -1178,6 +1427,20 @@ def carregar_config() -> dict:
         # E o modo usado quando o bot roda hospedado (GitHub Actions).
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
+        # Janela de pico: por padrao 22:00 as 09:00 (horario de Brasilia),
+        # rastreando a cada 30s em vez do intervalo normal. Ajustavel sem
+        # mexer no codigo — so preencher no Railway/.env.
+        "janela_rapida_inicio": _minutos_do_dia(
+            os.getenv("JANELA_RAPIDA_INICIO", JANELA_RAPIDA_INICIO_PADRAO),
+            JANELA_RAPIDA_INICIO_PADRAO,
+        ),
+        "janela_rapida_fim": _minutos_do_dia(
+            os.getenv("JANELA_RAPIDA_FIM", JANELA_RAPIDA_FIM_PADRAO),
+            JANELA_RAPIDA_FIM_PADRAO,
+        ),
+        "intervalo_rapido": _inteiro_do_ambiente(
+            "INTERVALO_RAPIDO_SEGUNDOS", INTERVALO_RAPIDO_PADRAO,
+        ),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
     }
@@ -1370,22 +1633,31 @@ def intervalo_atual(config: dict) -> int:
     """
     Decide quantos segundos esperar ate a proxima rodada.
 
-    Entre JANELA_RAPIDA_INICIO e JANELA_RAPIDA_FIM (horario de Brasilia),
-    usa INTERVALO_RAPIDO_SEGUNDOS (rastreio mais rapido, ideal pra horario
-    de lancamento). Fora dessa janela, usa o intervalo normal configurado
-    (config["intervalo"] / variavel INTERVALO_SEGUNDOS).
+    Entre a janela de pico configurada (config["janela_rapida_inicio"] a
+    config["janela_rapida_fim"], horario de Brasilia — pode atravessar a
+    meia-noite, ex: 22:00 as 09:00), usa config["intervalo_rapido"]
+    (rastreio mais rapido, ideal pra horario de lancamento). Fora dessa
+    janela, usa o intervalo normal (config["intervalo"]).
     """
     agora_brasil = datetime.now(FUSO_HORARIO_JANELA)
+    minutos_agora = agora_brasil.hour * 60 + agora_brasil.minute
+    inicio, fim = config["janela_rapida_inicio"], config["janela_rapida_fim"]
 
-    if JANELA_RAPIDA_INICIO <= agora_brasil.hour < JANELA_RAPIDA_FIM:
-        return INTERVALO_RAPIDO_SEGUNDOS
+    # Janela que atravessa a meia-noite (ex: 22:00 as 09:00): esta dentro
+    # se for DEPOIS do inicio OU ANTES do fim. Janela normal (ex: 04:00
+    # as 09:00): esta dentro se for entre os dois.
+    dentro_da_janela = (
+        (minutos_agora >= inicio or minutos_agora < fim) if inicio > fim
+        else (inicio <= minutos_agora < fim)
+    )
 
-    return config["intervalo"]
+    return config["intervalo_rapido"] if dentro_da_janela else config["intervalo"]
 
 
 def paginas_desta_rodada(primeira_vez: bool) -> tuple:
     """
-    Decide se esta rodada le so o topo ou faz a varredura profunda.
+    Decide se esta rodada le a leitura rapida de rotina ou faz a
+    varredura profunda.
 
     Devolve (quantas_paginas, e_varredura_profunda).
 
@@ -1402,7 +1674,7 @@ def paginas_desta_rodada(primeira_vez: bool) -> tuple:
         _ultima_varredura = agora
         return PAGINAS_PROFUNDAS, True
 
-    return 1, False
+    return PAGINAS_RAPIDAS, False
 
 
 def executar_rodada(config: dict) -> None:
@@ -2034,7 +2306,23 @@ def main() -> None:
         "--testar", action="store_true",
         help="So envia uma mensagem de teste e sai (nao coleta nada).",
     )
+    leitor.add_argument(
+        "--buscar", metavar="TERMO",
+        help="Procura produtos pelo titulo e mostra todas as fotos (nao envia nada).",
+    )
+    leitor.add_argument(
+        "--testar-rede", dest="testar_rede", action="store_true",
+        help="Confere se este servidor alcanca cssdeals/Telegram/Discord (IPv4 e IPv6).",
+    )
     argumentos = leitor.parse_args()
+
+    if argumentos.testar_rede:
+        testar_rede()
+        return
+
+    if argumentos.buscar:
+        comando_buscar(argumentos.buscar)
+        return
 
     # O assistente roda ANTES da checagem de configuracao — e justamente
     # ele que cria o .env que a checagem exige.
@@ -2058,12 +2346,15 @@ def main() -> None:
         return
 
     if argumentos.loop:
+        _fmt_hhmm = lambda minutos: "{:02d}:{:02d}".format(minutos // 60, minutos % 60)
         log.info(
             "MODO CONTINUO ligado — verificando a cada %s segundos "
-            "(entre %02dh e %02dh, horario de Brasilia, verifica a cada "
+            "(entre %s e %s, horario de Brasilia, verifica a cada "
             "%s segundos).",
             config["intervalo"],
-            JANELA_RAPIDA_INICIO, JANELA_RAPIDA_FIM, INTERVALO_RAPIDO_SEGUNDOS,
+            _fmt_hhmm(config["janela_rapida_inicio"]),
+            _fmt_hhmm(config["janela_rapida_fim"]),
+            config["intervalo_rapido"],
         )
 
         janela_rapida_ativa_antes = False
@@ -2076,13 +2367,13 @@ def main() -> None:
 
             espera = intervalo_atual(config)
 
-            janela_rapida_ativa = espera == INTERVALO_RAPIDO_SEGUNDOS
+            janela_rapida_ativa = espera == config["intervalo_rapido"]
             if janela_rapida_ativa != janela_rapida_ativa_antes:
                 if janela_rapida_ativa:
                     log.info(
-                        "Entrando na janela rapida (%02dh-%02dh): "
-                        "rastreio a cada %ss.",
-                        JANELA_RAPIDA_INICIO, JANELA_RAPIDA_FIM, espera,
+                        "Entrando na janela rapida (%s-%s): rastreio a cada %ss.",
+                        _fmt_hhmm(config["janela_rapida_inicio"]),
+                        _fmt_hhmm(config["janela_rapida_fim"]), espera,
                     )
                 else:
                     log.info(
