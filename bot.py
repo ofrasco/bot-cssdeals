@@ -17,6 +17,7 @@ from __future__ import annotations   # compatibilidade com Python 3.9
 
 import argparse
 import html
+import json
 import logging
 import os
 import re
@@ -146,6 +147,13 @@ CATEGORIAS = {
 
 BANCO_DADOS = "dados.db"          # arquivo SQLite onde tudo fica salvo
 ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
+
+# --- Reestoque: produtos que esgotaram e voltaram a vender ---
+# Depois de avisar um produto, ficamos de olho no estoque dele por um
+# tempo. Se ele esgotar e depois voltar a ter estoque, avisamos de novo —
+# e uma segunda chance de comprar o mesmo item.
+REESTOQUE_MAX_ITENS = 300         # quantos produtos notificados ficam sob vigilancia
+REESTOQUE_SIMULTANEAS = 6         # checagens de estoque em paralelo
 # Segundos entre cada rodada no modo --loop (servidor sempre ligado).
 # 60s da o menor atraso possivel sem pesar no site: e 1 consulta por
 # minuto, enquanto o site publica ~2 produtos a cada 15 minutos.
@@ -164,7 +172,7 @@ INTERVALO_PADRAO = 60
 FUSO_HORARIO_JANELA = ZoneInfo("America/Sao_Paulo")
 JANELA_RAPIDA_INICIO_PADRAO = "22:00"
 JANELA_RAPIDA_FIM_PADRAO = "09:00"
-INTERVALO_RAPIDO_PADRAO = 30
+INTERVALO_RAPIDO_PADRAO = 15
 DELAY_ENTRE_REQUISICOES = 1.5     # (sem uso no momento — ver DELAY_ENTRE_PAGINAS)
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
@@ -638,18 +646,8 @@ def buscar_detalhe_produto(sessao: requests.Session, produto_id: str) -> Optiona
     return corpo.get("data") or None
 
 
-def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
-    """
-    Completa o item com as fotos reais, a variacao (cor/tamanho) e o link
-    de origem, buscando na pagina do proprio produto.
-
-    Se essa busca falhar por qualquer motivo, o item fica como estava (com
-    a capa) — nunca impede o aviso de ser enviado.
-    """
-    detalhe = buscar_detalhe_produto(sessao, item["id"])
-    if not detalhe:
-        return
-
+def _aplicar_detalhe_no_item(item: dict, detalhe: dict) -> None:
+    """Aplica as fotos reais, variacao e link de origem de um `detalhe` (ja buscado) no item."""
     fotos_reais = [
         str(foto.get("url") or "").strip() + REDIMENSIONA_FOTO
         for foto in (detalhe.get("images") or [])
@@ -665,6 +663,119 @@ def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
         origem = str(skus[0].get("sourceLink") or "").strip()
         if origem:
             item["origem"] = origem
+
+
+def enriquecer_com_detalhes(sessao: requests.Session, item: dict) -> None:
+    """
+    Completa o item com as fotos reais, a variacao (cor/tamanho) e o link
+    de origem, buscando na pagina do proprio produto.
+
+    Se essa busca falhar por qualquer motivo, o item fica como estava (com
+    a capa) — nunca impede o aviso de ser enviado.
+    """
+    detalhe = buscar_detalhe_produto(sessao, item["id"])
+    if detalhe:
+        _aplicar_detalhe_no_item(item, detalhe)
+
+
+def montar_item_do_detalhe(detalhe: dict) -> Optional[dict]:
+    """
+    Monta um item completo a partir de uma resposta do endpoint de
+    DETALHE (e nao da listagem). Usado para reavisar um produto que
+    esgotou e voltou ao estoque — nesse ponto so temos o id, entao
+    buscamos tudo de novo direto na pagina do produto.
+    """
+    item = montar_item(detalhe)
+    if item:
+        _aplicar_detalhe_no_item(item, detalhe)
+    return item
+
+
+def quantidade_total(detalhe: dict) -> int:
+    """Soma o estoque de todas as variacoes (skus) de um produto."""
+    total = 0
+    for sku in (detalhe.get("skus") or []):
+        try:
+            total += int(sku.get("quantity") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def carregar_estoque(caminho: str) -> dict:
+    """Le o arquivo de vigilancia de estoque. Se nao existir, devolve vazio."""
+    if not os.path.exists(caminho):
+        return {}
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            return json.load(arquivo)
+    except (OSError, ValueError) as erro:
+        log.warning("Nao consegui ler %s (%s). Comecando do zero.", caminho, erro)
+        return {}
+
+
+def salvar_estoque(caminho: str, mapa: dict) -> None:
+    """Grava o arquivo de vigilancia, mantendo so os REESTOQUE_MAX_ITENS mais recentes."""
+    recentes = dict(list(mapa.items())[-REESTOQUE_MAX_ITENS:])
+    temporario = caminho + ".tmp"
+    try:
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            json.dump(recentes, arquivo)
+        os.replace(temporario, caminho)
+    except OSError as erro:
+        log.warning("Nao consegui salvar %s (%s).", caminho, erro)
+
+
+def verificar_reestoques(sessao: requests.Session, mapa_estoque: dict) -> list:
+    """
+    Reconfere o estoque de todos os produtos sob vigilancia (mapa_estoque)
+    em paralelo. Devolve a lista de itens que ESGOTARAM E VOLTARAM — os
+    unicos que precisam de um novo aviso. Atualiza mapa_estoque no lugar.
+
+    Uma falha ao checar um produto especifico (site fora do ar, produto
+    removido) so deixa o status como estava — nunca derruba a rodada.
+    """
+    if not mapa_estoque:
+        return []
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    ids = list(mapa_estoque.keys())
+    reestocados = []
+
+    with ThreadPoolExecutor(max_workers=REESTOQUE_SIMULTANEAS) as executor:
+        tarefas = {executor.submit(buscar_detalhe_produto, sessao, id_): id_ for id_ in ids}
+        for tarefa in tarefas:
+            id_ = tarefas[tarefa]
+            try:
+                detalhe = tarefa.result()
+            except Exception as erro:
+                log.warning("Falha ao reconferir estoque de %s (%s).", id_, erro)
+                continue
+            if not detalhe:
+                continue   # produto pode ter saido do ar — mantem status antigo
+
+            disponivel_agora = quantidade_total(detalhe) > 0
+            status_anterior = mapa_estoque.get(id_)
+
+            if status_anterior == "esgotado" and disponivel_agora:
+                item = montar_item_do_detalhe(detalhe)
+                if item:
+                    item["reestoque"] = True
+                    reestocados.append(item)
+                mapa_estoque[id_] = "disponivel"
+            elif status_anterior != "esgotado" and not disponivel_agora:
+                mapa_estoque[id_] = "esgotado"
+            else:
+                mapa_estoque[id_] = "disponivel" if disponivel_agora else "esgotado"
+
+    return reestocados
+
+
+def _caminho_estoque(caminho_base: str) -> str:
+    """Deriva o nome do arquivo de vigilancia de estoque a partir de outro caminho."""
+    base, _ext = os.path.splitext(caminho_base)
+    return base + ".estoque.json"
 
 
 def buscar_por_titulo(termo: str, quantos: int = 10) -> list:
@@ -1063,7 +1174,8 @@ def titulo_visivel(item: dict) -> str:
 
 def montar_texto_telegram(item: dict) -> str:
     """Monta a mensagem no formato HTML do Telegram (negrito, link clicavel)."""
-    linhas = ["\U0001F195 <b>{}</b>".format(escapar_html(titulo_visivel(item)))]
+    etiqueta = "🔄 VOLTOU AO ESTOQUE" if item.get("reestoque") else "\U0001F195 NOVO"
+    linhas = ["{} <b>{}</b>".format(etiqueta, escapar_html(titulo_visivel(item)))]
 
     # Mostra o titulo original tambem — util para procurar o produto no site
     original = item["titulo"]
@@ -1244,9 +1356,10 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
 
     O Discord monta um card bonito (embed) com titulo, link e foto.
     """
+    prefixo = "🔄 VOLTOU AO ESTOQUE: " if item.get("reestoque") else ""
     embed = {
-        "title": titulo_visivel(item)[:250],
-        "color": 0x00B37E,   # verdinho
+        "title": (prefixo + titulo_visivel(item))[:250],
+        "color": 0xFFA500 if item.get("reestoque") else 0x00B37E,   # laranja pro reestoque, verde pro lancamento
     }
     if item.get("link"):
         embed["url"] = item["link"]
@@ -1504,6 +1617,23 @@ def rodar_coleta(config: dict) -> None:
 
     # Passo 1: buscar os produtos mais recentes na API do site
     paginas, profunda = paginas_desta_rodada(primeira_vez)
+
+    # Reestoque: reconfere, so na varredura profunda (a cada ~20 min), os
+    # produtos que ja avisamos antes — se algum esgotou e voltou a vender,
+    # avisa de novo.
+    caminho_estoque = _caminho_estoque(BANCO_DADOS)
+    mapa_estoque = carregar_estoque(caminho_estoque)
+    if profunda and mapa_estoque:
+        reestocados = verificar_reestoques(sessao, mapa_estoque)
+        salvar_estoque(caminho_estoque, mapa_estoque)
+        if reestocados:
+            log.info("REESTOQUE: %s produto(s) esgotado(s) voltaram a vender.", len(reestocados))
+            for item in reestocados:
+                item["publicado_em"] = datetime.now(timezone.utc)
+                log.info("Avisando REESTOQUE: %s", titulo_visivel(item)[:60])
+                notificar(item, config)
+                time.sleep(DELAY_ENTRE_MENSAGENS)
+
     if profunda:
         log.info(
             "Varredura PROFUNDA: lendo %s paginas (~%s produtos) para achar "
@@ -1610,12 +1740,14 @@ def rodar_coleta(config: dict) -> None:
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
             if notificar(item, config):
                 marcar_notificado(conexao, item["id"])
+                mapa_estoque[item["id"]] = "disponivel"   # entra sob vigilancia de reestoque
             else:
                 erros += 1
             # pausa para nao estourar o limite do Telegram (~1 msg/segundo)
             if numero < len(a_enviar):
                 time.sleep(DELAY_ENTRE_MENSAGENS)
 
+    salvar_estoque(caminho_estoque, mapa_estoque)
     conexao.close()
 
     duracao = time.time() - inicio
@@ -1699,6 +1831,7 @@ def rodar_coleta_arquivo(config: dict) -> None:
     """
     inicio = time.time()
     caminho = config["arquivo_estado"]
+    caminho_estoque = _caminho_estoque(caminho)
     log.info("=" * 60)
     log.info("Procurando lancamentos novos em %s", SITE_BASE)
 
@@ -1711,6 +1844,23 @@ def rodar_coleta_arquivo(config: dict) -> None:
 
     sessao = criar_sessao()
     paginas, profunda = paginas_desta_rodada(primeira_vez)
+
+    # Reestoque: reconfere, so na varredura profunda (a cada ~20 min), os
+    # produtos que ja avisamos antes — se algum esgotou e voltou a vender,
+    # avisa de novo. So roda na profunda pra nao pesar no site a cada
+    # rodada rapida de 15-60s.
+    mapa_estoque = carregar_estoque(caminho_estoque)
+    if profunda and mapa_estoque:
+        reestocados = verificar_reestoques(sessao, mapa_estoque)
+        salvar_estoque(caminho_estoque, mapa_estoque)
+        if reestocados:
+            log.info("REESTOQUE: %s produto(s) esgotado(s) voltaram a vender.", len(reestocados))
+            for item in reestocados:
+                item["publicado_em"] = datetime.now(timezone.utc)
+                log.info("Avisando REESTOQUE: %s", titulo_visivel(item)[:60])
+                notificar(item, config)
+                time.sleep(DELAY_ENTRE_MENSAGENS)
+
     if profunda:
         log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
                  paginas, paginas * TAMANHO_PAGINA)
@@ -1777,10 +1927,13 @@ def rodar_coleta_arquivo(config: dict) -> None:
         if notificar(item, config):
             ja_vistos.append(item["id"])
             salvar_estado(caminho, ja_vistos)   # grava a cada envio (incremental)
+            mapa_estoque[item["id"]] = "disponivel"   # entra sob vigilancia de reestoque
         else:
             erros += 1
         if numero < len(a_enviar):
             time.sleep(DELAY_ENTRE_MENSAGENS)
+
+    salvar_estoque(caminho_estoque, mapa_estoque)
 
     log.info(
         "Rodada concluida em %.1fs | lidos: %s | novos: %s | erros de envio: %s",
