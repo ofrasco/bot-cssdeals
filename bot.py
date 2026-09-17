@@ -606,7 +606,8 @@ def montar_item(registro: dict) -> Optional[dict]:
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
         "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
         "origem": str(registro.get("sourceLink") or "").strip(),
-        "variacao": "",                                     # cor/tamanho — preenchido depois
+        "cor": "Padrão",                                     # preenchido depois, se houver
+        "tamanho": "Padrão",                                 # preenchido depois, se houver
     }
 
 
@@ -646,8 +647,73 @@ def buscar_detalhe_produto(sessao: requests.Session, produto_id: str) -> Optiona
     return corpo.get("data") or None
 
 
+def _limpar_texto_variacao(valor: str) -> str:
+    """Remove anotacoes entre parenteses e pontuacao sobrando de um pedaco de variacao."""
+    valor = re.sub(r"[\(（][^)）]*[\)）]", "", valor)          # tira "(No Print)", "（No Badge）"
+    valor = valor.replace("：", ":").replace("；", ";")        # pontuacao de largura total -> normal
+    return valor.strip(" :;,\u3000")
+
+
+def _limpar_cor(valor: str) -> str:
+    """Alem de limpar, tira codigos internos (ex: '2425AC') que vem colados na cor."""
+    valor = _limpar_texto_variacao(valor)
+    palavras = valor.split()
+    # Codigo interno: mistura letra+numero, sem espaco, curto (ex: 2425AC, CD001)
+    while palavras and re.match(r"^(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9]{2,8}$", palavras[0]):
+        palavras.pop(0)
+    valor = " ".join(palavras).strip()
+    return valor[:1].upper() + valor[1:] if valor else ""
+
+
+def interpretar_variacao(skuNames: str) -> tuple:
+    """
+    Extrai cor e tamanho de um texto de variacao cru, tipo:
+    'Color Classification:away：（No Print）;Size:2XL ( No Badge );'
+    ou 'Cor:2425AC fora de casa;Tamanho:XXL;'
+
+    Alguns produtos (tenis, por exemplo) nao rotulam o valor — vem so
+    '44', sem nenhum 'Size:' ou 'Tamanho:' na frente. Nesse caso, se o
+    valor sobrando parecer um numero/tamanho, ele CONTA como tamanho —
+    "Padrao" e reservado so pra quando nao ha NENHUMA informacao no sku.
+
+    Devolve (cor, tamanho), cada um "Padrao" se nao achar nada mesmo.
+    """
+    cor, tamanho = "", ""
+    achou_rotulo = False
+
+    if skuNames:
+        for rotulo, valor in re.findall(
+            r"(cor|color(?:\s*classification)?|tamanho|size)\s*[:：]\s*([^;&]+)",
+            skuNames, re.IGNORECASE,
+        ):
+            achou_rotulo = True
+            if rotulo.lower().startswith(("cor", "color")):
+                cor = _limpar_cor(valor) or cor
+            else:
+                tamanho = _limpar_texto_variacao(valor) or tamanho
+
+        # Nenhum rotulo "Cor:"/"Tamanho:" encontrado — o site so mandou um
+        # valor solto (ex: so "44"). Se parecer numero/tamanho, usa como
+        # tamanho; senao, assume que e uma cor/variacao sem nome de campo.
+        if not achou_rotulo:
+            texto = skuNames
+            if "&" in texto or texto.startswith("sku="):
+                # formato de query string: pega SO a parte do "sku=",
+                # ignorando "sku_id=" (que e outra coisa, nao a variacao)
+                partes = [p[4:] for p in texto.split("&") if p.startswith("sku=")]
+                texto = partes[0] if partes else ""
+            sobra = _limpar_texto_variacao(texto)
+            if sobra:
+                if re.match(r"^\d{1,3}(\.\d+)?$|^(XX?S|S|M|L|XX?L|XXX?L)$", sobra, re.IGNORECASE):
+                    tamanho = sobra
+                else:
+                    cor = _limpar_cor(sobra)
+
+    return cor or "Padrão", tamanho or "Padrão"
+
+
 def _aplicar_detalhe_no_item(item: dict, detalhe: dict) -> None:
-    """Aplica as fotos reais, variacao e link de origem de um `detalhe` (ja buscado) no item."""
+    """Aplica as fotos reais, variacao (cor/tamanho) e link de origem de um `detalhe` no item."""
     fotos_reais = [
         str(foto.get("url") or "").strip() + REDIMENSIONA_FOTO
         for foto in (detalhe.get("images") or [])
@@ -659,7 +725,7 @@ def _aplicar_detalhe_no_item(item: dict, detalhe: dict) -> None:
 
     skus = detalhe.get("skus") or []
     if skus:
-        item["variacao"] = str(skus[0].get("skuNames") or "").strip()
+        item["cor"], item["tamanho"] = interpretar_variacao(str(skus[0].get("skuNames") or ""))
         origem = str(skus[0].get("sourceLink") or "").strip()
         if origem:
             item["origem"] = origem
@@ -1186,23 +1252,25 @@ def montar_texto_telegram(item: dict) -> str:
     if etiquetas:
         linhas.append(escapar_html(" · ".join(etiquetas)))
 
-    if item.get("preco"):
-        linhas.append("Preco: <b>{}</b>".format(escapar_html(item["preco"])))
+    # "COMPRAR AGORA" em destaque, logo no topo
+    if item.get("link_compra"):
+        linhas.append('🛒 <b><a href="{}">COMPRAR AGORA</a></b>'.format(item["link_compra"]))
 
-    if item.get("variacao"):
-        linhas.append("🎨 {}".format(escapar_html(item["variacao"])))
+    linhas.append("")
+    linhas.append("💰 Preço: <b>{}</b>".format(escapar_html(item.get("preco") or "N/A")))
+    linhas.append("📏 Tamanho: <b>{}</b>".format(escapar_html(item.get("tamanho") or "Padrão")))
+    linhas.append("🎨 Cor: <b>{}</b>".format(escapar_html(item.get("cor") or "Padrão")))
 
     if item.get("link"):
-        linhas.append('<a href="{}">📄 Ver no CSSDeals</a>'.format(item["link"]))
+        linhas.append('📄 <a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
 
-    if item.get("link_compra"):
-        linhas.append('<a href="{}">🛒 Comprar Agora</a>'.format(item["link_compra"]))
-
-    # Link de origem em TEXTO puro (nao so como link clicavel): fica
-    # pesquisavel no historico da conversa, pra achar depois qual
-    # vendedor tinha o produto.
+    # Link de origem e ID: mais abaixo e sem destaque (italico) — o link
+    # mostra so o texto "Acessar Fonte", clicavel, nunca a URL inteira.
+    rodape = []
     if item.get("origem"):
-        linhas.append("🔗 Origem: {}".format(escapar_html(item["origem"])))
+        rodape.append('🔗 <a href="{}">Acessar Fonte</a>'.format(item["origem"]))
+    rodape.append("🆔 {}".format(escapar_html(item["id"])))
+    linhas.append("<i>{}</i>".format(" · ".join(rodape)))
 
     if item.get("publicado_em"):
         horario = item["publicado_em"].strftime("%d/%m/%Y %H:%M UTC")
@@ -1372,23 +1440,38 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if item.get("publicado_em"):
         embed["timestamp"] = item["publicado_em"].isoformat()
 
-    detalhes = []
+    # "COMPRAR AGORA" em destaque no topo do card — link em markdown, que
+    # o Discord renderiza como texto clicavel. Nao depende de botao (que
+    # nem todo Webhook aceita), entao SEMPRE aparece.
+    linhas_descricao = []
+    if item.get("link_compra"):
+        linhas_descricao.append("🛒 **[COMPRAR AGORA]({})**".format(item["link_compra"]))
     original = item["titulo"]
     if original and original != titulo_visivel(item):
-        detalhes.append("*{}*".format(original[:200]))
-    if item.get("preco"):
-        detalhes.append("**{}**".format(item["preco"]))
+        linhas_descricao.append("*{}*".format(original[:200]))
     etiquetas = [e for e in (item.get("categoria"), item.get("plataforma")) if e]
     if etiquetas:
-        detalhes.append(" · ".join(etiquetas))
-    if item.get("variacao"):
-        detalhes.append("🎨 {}".format(item["variacao"]))
-    # Link de origem em TEXTO (nao so no botao): assim fica no historico
-    # do canal, dando pra pesquisar depois qual vendedor tinha o produto.
+        linhas_descricao.append(" · ".join(etiquetas))
+    if linhas_descricao:
+        embed["description"] = "\n".join(linhas_descricao)
+
+    # Preco / Tamanho / Cor lado a lado, em destaque (campos "inline"
+    # ficam em coluna, o Discord encaixa 3 por linha sozinho).
+    embed["fields"] = [
+        {"name": "💰 Preço", "value": item.get("preco") or "N/A", "inline": True},
+        {"name": "📏 Tamanho", "value": item.get("tamanho") or "Padrão", "inline": True},
+        {"name": "🎨 Cor", "value": item.get("cor") or "Padrão", "inline": True},
+    ]
+    # Link de origem e ID: mais abaixo e sem destaque (em italico, lado a
+    # lado, ocupando menos espaco que os campos de cima). O link mostra
+    # so o texto "Acessar Fonte", clicavel — nunca a URL inteira.
     if item.get("origem"):
-        detalhes.append("🔗 Origem: {}".format(item["origem"]))
-    if detalhes:
-        embed["description"] = "\n".join(detalhes)
+        embed["fields"].append({
+            "name": "🔗 Link Original",
+            "value": "*[Acessar Fonte]({})*".format(item["origem"]),
+            "inline": True,
+        })
+    embed["fields"].append({"name": "🆔 ID", "value": "*{}*".format(item["id"]), "inline": True})
 
     # Fotos extras: o Discord agrupa varios embeds numa unica galeria
     # quando todos compartilham a mesma "url" — por isso os embeds extras
@@ -1398,18 +1481,14 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         for extra in imagens[1:MAX_IMAGENS_DISCORD]:
             embeds.append({"url": item["link"], "image": {"url": extra}})
 
-    # Botoes (link direto, sem precisar clicar no titulo pequeno do embed) —
-    # agiliza a compra. Sao botoes do tipo "link": so abrem uma URL, nao
-    # precisam de nenhum bot rodando por tras, entao funcionam com qualquer
-    # Webhook comum do Discord.
-    botoes = []
+    # Botao (alem do link em destaque na descricao): reforco visual, mas
+    # nao e a unica forma de comprar — se o Webhook recusar botao, o link
+    # da descricao acima continua funcionando.
+    componentes = []
     if item.get("link_compra"):
-        botoes.append({"type": 2, "style": 5, "label": "🛒 Comprar Agora", "url": item["link_compra"]})
-    if item.get("link"):
-        botoes.append({"type": 2, "style": 5, "label": "📄 Ver no CSSDeals", "url": item["link"]})
-    if item.get("origem"):
-        botoes.append({"type": 2, "style": 5, "label": "🔗 Fornecedor Original", "url": item["origem"]})
-    componentes = [{"type": 1, "components": botoes}] if botoes else []
+        componentes = [{"type": 1, "components": [
+            {"type": 2, "style": 5, "label": "🛒 COMPRAR AGORA", "url": item["link_compra"]},
+        ]}]
 
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
