@@ -1503,7 +1503,15 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
             payload = {"embeds": embeds}
             if componentes:
                 payload["components"] = componentes
+            # LOG TEMPORARIO DE DIAGNOSTICO: mostra exatamente o que estamos
+            # mandando pro Discord, pra confirmar se o "COMPRAR AGORA" esta
+            # saindo daqui ou se some depois (do lado do Discord).
+            log.info("DIAGNOSTICO description enviada: %r", embed.get("description"))
             resposta = requests.post(webhook_url, json=payload, timeout=TIMEOUT)
+            if resposta.status_code not in (200, 204):
+                log.warning(
+                    "Discord respondeu %s: %s", resposta.status_code, resposta.text[:500]
+                )
 
             # Se o Discord recusar por causa dos botoes (webhook antigo,
             # sem suporte a componentes), tenta de novo so com os embeds —
