@@ -1445,7 +1445,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     # nem todo Webhook aceita), entao SEMPRE aparece.
     linhas_descricao = []
     if item.get("link_compra"):
-        linhas_descricao.append("🛒 **[COMPRAR AGORA]({})**".format(item["link_compra"]))
+        linhas_descricao.append("🛒 [**COMPRAR AGORA**]({})".format(item["link_compra"]))
     original = item["titulo"]
     if original and original != titulo_visivel(item):
         linhas_descricao.append("*{}*".format(original[:200]))
@@ -1468,7 +1468,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if item.get("origem"):
         embed["fields"].append({
             "name": "🔗 Link Original",
-            "value": "*[Acessar Fonte]({})*".format(item["origem"]),
+            "value": "[Acessar Fonte]({})".format(item["origem"]),
             "inline": True,
         })
     embed["fields"].append({"name": "🆔 ID", "value": "*{}*".format(item["id"]), "inline": True})
