@@ -1440,12 +1440,14 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if item.get("publicado_em"):
         embed["timestamp"] = item["publicado_em"].isoformat()
 
-    # "COMPRAR AGORA" em destaque no topo do card — link em markdown, que
-    # o Discord renderiza como texto clicavel. Nao depende de botao (que
-    # nem todo Webhook aceita), entao SEMPRE aparece.
+    # "COMPRAR AGORA" em destaque no topo do card. Igual ao Link Original,
+    # evitamos o formato "[texto](link)" aqui tambem — em vez de um texto
+    # bonito clicavel, mostramos o rotulo em negrito e a URL crua logo
+    # abaixo. Fica menos elegante, mas o negrito e o link SEMPRE
+    # funcionam, sem depender do bug de link mascarado do Discord.
     linhas_descricao = []
     if item.get("link_compra"):
-        linhas_descricao.append("🛒 [**COMPRAR AGORA**]({})".format(item["link_compra"]))
+        linhas_descricao.append("🛒 **COMPRAR AGORA**\n{}".format(item["link_compra"]))
     original = item["titulo"]
     if original and original != titulo_visivel(item):
         linhas_descricao.append("*{}*".format(original[:200]))
@@ -1462,16 +1464,22 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         {"name": "📏 Tamanho", "value": item.get("tamanho") or "Padrão", "inline": True},
         {"name": "🎨 Cor", "value": item.get("cor") or "Padrão", "inline": True},
     ]
-    # Link de origem e ID: mais abaixo e sem destaque (em italico, lado a
-    # lado, ocupando menos espaco que os campos de cima). O link mostra
-    # so o texto "Acessar Fonte", clicavel — nunca a URL inteira.
+    # Link de origem e ID: mais abaixo e sem destaque (lado a lado,
+    # ocupando menos espaco que os campos de cima).
+    #
+    # IMPORTANTE: o formato "[texto](link)" (link mascarado) tem um bug
+    # CONHECIDO do proprio Discord — falha e mostra tudo cru de vez em
+    # quando, sem padrao claro de quando acontece (bug aberto no
+    # rastreador oficial deles). Por isso, paramos de usar esse formato
+    # aqui: colamos a URL crua mesmo, que o Discord SEMPRE transforma em
+    # link clicavel sozinho, sem depender de nenhum markdown.
     if item.get("origem"):
         embed["fields"].append({
             "name": "🔗 Link Original",
-            "value": "[Acessar Fonte]({})".format(item["origem"]),
-            "inline": True,
+            "value": item["origem"],
+            "inline": False,
         })
-    embed["fields"].append({"name": "🆔 ID", "value": "*{}*".format(item["id"]), "inline": True})
+    embed["fields"].append({"name": "🆔 ID", "value": item["id"], "inline": True})
 
     # Fotos extras: o Discord agrupa varios embeds numa unica galeria
     # quando todos compartilham a mesma "url" — por isso os embeds extras
