@@ -1424,6 +1424,11 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
 
     O Discord monta um card bonito (embed) com titulo, link e foto.
     """
+    # LOG TEMPORARIO DE DIAGNOSTICO: mostra o item exatamente como chegou
+    # nesta funcao, antes de qualquer processamento.
+    log.info("DIAGNOSTICO item recebido: link_compra=%r chaves=%r",
+             item.get("link_compra"), sorted(item.keys()))
+
     prefixo = "🔄 VOLTOU AO ESTOQUE: " if item.get("reestoque") else ""
     embed = {
         "title": (prefixo + titulo_visivel(item))[:250],
@@ -1985,6 +1990,8 @@ def rodar_coleta_arquivo(config: dict) -> None:
     # na ordem em que os produtos foram publicados.
     novos = [i for i in itens if i["id"] not in conjunto][::-1]
     log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
+    for i in novos:
+        log.info("DIAGNOSTICO novo item recem-criado: id=%s link_compra=%r", i["id"], i.get("link_compra"))
 
     if novos and len(novos) == len(itens):
         log.warning(
