@@ -281,13 +281,13 @@ def abrir_banco() -> sqlite3.Connection:
         )
         """
     )
-    # Coluna adicionada depois — guarda TODAS as fotos do produto (nao so
-    # a primeira), separadas por "|". Banco antigo nao tem essa coluna
-    # ainda, entao tentamos criar e ignoramos o erro se ja existir.
-    try:
-        conexao.execute("ALTER TABLE itens ADD COLUMN imagens TEXT")
-    except sqlite3.OperationalError:
-        pass
+    # Colunas adicionadas depois — banco antigo nao tem elas ainda, entao
+    # tentamos criar e ignoramos o erro se ja existir.
+    for coluna in ("imagens TEXT", "link_compra TEXT", "cor TEXT", "tamanho TEXT"):
+        try:
+            conexao.execute("ALTER TABLE itens ADD COLUMN {}".format(coluna))
+        except sqlite3.OperationalError:
+            pass
     conexao.commit()
     return conexao
 
@@ -316,14 +316,16 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
     conexao.execute(
         """
         INSERT OR IGNORE INTO itens
-            (id, titulo, titulo_pt, imagem, imagens, link, preco, categoria,
-             plataforma, origem, visto_em, notificado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, titulo, titulo_pt, imagem, imagens, link, link_compra, preco,
+             categoria, plataforma, origem, cor, tamanho, visto_em, notificado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"], item["titulo"], item.get("titulo_pt", ""),
             item["imagem"], "|".join(item.get("imagens") or []), item["link"],
-            item["preco"], item["categoria"], item["plataforma"], item["origem"],
+            item.get("link_compra", ""), item["preco"], item["categoria"],
+            item["plataforma"], item["origem"], item.get("cor", "Padrão"),
+            item.get("tamanho", "Padrão"),
             datetime.now().isoformat(timespec="seconds"),
             1 if ja_notificado else 0,
         ),
@@ -342,16 +344,21 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     """
     cursor = conexao.execute(
         """
-        SELECT id, titulo, titulo_pt, imagem, imagens, link, preco, categoria,
-               plataforma, origem
+        SELECT id, titulo, titulo_pt, imagem, imagens, link, link_compra, preco,
+               categoria, plataforma, origem, cor, tamanho
         FROM itens WHERE notificado = 0 ORDER BY visto_em
         """
     )
     return [
         {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "imagem": l[3],
          "imagens": (l[4] or "").split("|") if l[4] else ([l[3]] if l[3] else []),
-         "link": l[5], "preco": l[6], "categoria": l[7], "plataforma": l[8],
-         "origem": l[9]}
+         "link": l[5],
+         # Bancos criados antes desta correcao nao tem link_compra salvo —
+         # nesse caso, remonta na hora (nao depende de nenhuma chamada de
+         # rede, so precisa do id).
+         "link_compra": l[6] or (URL_COMPRA.format(id=l[0]) + CSSBUY_EXTRA if l[0] else ""),
+         "preco": l[7], "categoria": l[8], "plataforma": l[9], "origem": l[10],
+         "cor": l[11] or "Padrão", "tamanho": l[12] or "Padrão"}
         for l in cursor.fetchall()
     ]
 
@@ -1424,11 +1431,6 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
 
     O Discord monta um card bonito (embed) com titulo, link e foto.
     """
-    # LOG TEMPORARIO DE DIAGNOSTICO: mostra o item exatamente como chegou
-    # nesta funcao, antes de qualquer processamento.
-    log.info("DIAGNOSTICO item recebido: link_compra=%r chaves=%r",
-             item.get("link_compra"), sorted(item.keys()))
-
     prefixo = "🔄 VOLTOU AO ESTOQUE: " if item.get("reestoque") else ""
     embed = {
         "title": (prefixo + titulo_visivel(item))[:250],
@@ -1508,10 +1510,6 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
             payload = {"embeds": embeds}
             if componentes:
                 payload["components"] = componentes
-            # LOG TEMPORARIO DE DIAGNOSTICO: mostra exatamente o que estamos
-            # mandando pro Discord, pra confirmar se o "COMPRAR AGORA" esta
-            # saindo daqui ou se some depois (do lado do Discord).
-            log.info("DIAGNOSTICO description enviada: %r", embed.get("description"))
             resposta = requests.post(webhook_url, json=payload, timeout=TIMEOUT)
             if resposta.status_code not in (200, 204):
                 log.warning(
@@ -1990,8 +1988,6 @@ def rodar_coleta_arquivo(config: dict) -> None:
     # na ordem em que os produtos foram publicados.
     novos = [i for i in itens if i["id"] not in conjunto][::-1]
     log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
-    for i in novos:
-        log.info("DIAGNOSTICO novo item recem-criado: id=%s link_compra=%r", i["id"], i.get("link_compra"))
 
     if novos and len(novos) == len(itens):
         log.warning(
